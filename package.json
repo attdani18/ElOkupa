@@ -1,14 +1,11 @@
 {
-  "name": "sargentobananobot",
+  "name": "sargento-banano",
   "version": "1.0.0",
-  "description": "Bot de Puerto Banano 506 con conexion de voz 24/7",
+  "private": true,
+  "description": "Bot de Puerto Banano con voz persistente",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=22.12.0"
-  },
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=22.12.0" },
   "dependencies": {
     "discord.js": "^14.22.1",
     "@discordjs/voice": "^0.19.0"

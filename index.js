@@ -1,103 +1,183 @@
-const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
-const { joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const { Client, GatewayIntentBits, Events } = require("discord.js");
 
-const token = process.env.DISCORD_TOKEN;
-const voiceChannelId = process.env.VOICE_CHANNEL_ID;
-if (!token || !voiceChannelId) {
-  console.error('Configura DISCORD_TOKEN y VOICE_CHANNEL_ID en Railway.');
+const {
+  joinVoiceChannel,
+  getVoiceConnection,
+  entersState,
+  VoiceConnectionStatus,
+  NoSubscriberBehavior,
+} = require("@discordjs/voice");
+
+// CONFIGURACIÓN
+const TOKEN = process.env.DISCORD_TOKEN;
+const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
+
+if (!TOKEN || !VOICE_CHANNEL_ID) {
+  console.error("❌ Faltan DISCORD_TOKEN o VOICE_CHANNEL_ID.");
   process.exit(1);
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
-const frasesTropicales = [
-  '¡Dijeron MONO! ¡Permiso, que esto se pone tropical!',
-  '¡Banano detectado, nivel de sabrosura aumentando!',
-  '¡Explosión tropical inminente!',
-  '¡Péguele al mono que se nos va!',
-  '¡Puerto Banano nunca se rinde!',
-  '¡Hora de la operación sabrosura!'
-];
-const gifsMonos = [
-  'https://media.tenor.com/SZdi4B2MZqwAAAAC/monkey-shoot.gif',
-  'https://media.tenor.com/JZMbPXX6kB4AAAAC/monke-shoot.gif',
-  'https://media.tenor.com/fmXt2NdKP2kAAAAC/gun-monkey.gif',
-  'https://media.tenor.com/N9SSMH09_H8AAAAC/monkey.gif'
-];
-let contador = 0;
-let checkingVoice = false;
-let targetChannel;
-const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+let reconnectTimer = null;
+let connecting = false;
+let shuttingDown = false;
 
-async function keepVoiceConnected() {
-  if (checkingVoice || !client.isReady()) return;
-  checkingVoice = true;
+// CONECTAR AL CANAL DE VOZ
+async function conectarVoz() {
+  if (connecting || shuttingDown || !client.isReady()) return;
+
+  connecting = true;
+
   try {
-    if (!targetChannel) targetChannel = await client.channels.fetch(voiceChannelId);
-    if (!targetChannel || ![ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(targetChannel.type)) {
-      console.error('VOICE_CHANNEL_ID no corresponde a un canal de voz válido.');
-      return;
+    console.log("🔎 Buscando canal:", VOICE_CHANNEL_ID);
+
+    const canal = await client.channels.fetch(VOICE_CHANNEL_ID);
+
+    if (!canal) {
+      throw new Error("No se encontró el canal.");
     }
-    const existing = getVoiceConnection(targetChannel.guild.id);
-    if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
-      if (existing.joinConfig.channelId === targetChannel.id) {
-        if (existing.state.status === VoiceConnectionStatus.Ready) return;
-        try {
-          await entersState(existing, VoiceConnectionStatus.Ready, 12000);
-          return;
-        } catch { existing.destroy(); }
-      } else {
-        existing.destroy();
+
+    console.log("🤖 Bot:", client.user.tag);
+    console.log("📢 Canal:", canal.name);
+    console.log("🏠 Servidor:", canal.guild?.name);
+    console.log("🔢 ID:", canal.id);
+
+    if (!canal.isVoiceBased()) {
+      throw new Error("El ID no corresponde a un canal de voz.");
+    }
+
+    const conexionActual = getVoiceConnection(canal.guild.id);
+
+    if (conexionActual) {
+      if (conexionActual.state.status === VoiceConnectionStatus.Ready) {
+        console.log("✅ El Okupa ya está conectado.");
+        return;
       }
+
+      conexionActual.destroy();
     }
-    const connection = joinVoiceChannel({
-      channelId: targetChannel.id,
-      guildId: targetChannel.guild.id,
-      adapterCreator: targetChannel.guild.voiceAdapterCreator,
+
+    console.log("🚪 El Okupa está intentando ocupar el VC...");
+
+    const conexion = joinVoiceChannel({
+      channelId: canal.id,
+      guildId: canal.guild.id,
+      adapterCreator: canal.guild.voiceAdapterCreator,
       selfDeaf: true,
-      selfMute: true
+      selfMute: true,
     });
-    connection.on('error', error => console.error('Error de voz:', error.message));
-    await entersState(connection, VoiceConnectionStatus.Ready, 25000);
-    console.log('🍌 Sargento Banano conectado a voz.');
+
+    conexion.on("stateChange", (anterior, nuevo) => {
+      console.log(
+        `🎙️ Estado de voz: ${anterior.status} → ${nuevo.status}`
+      );
+    });
+
+    conexion.on("error", (error) => {
+      console.error("❌ Error de voz:", error);
+    });
+
+    await entersState(
+      conexion,
+      VoiceConnectionStatus.Ready,
+      30000
+    );
+
+    console.log("🍌 EL OKUPA YA OCUPÓ LA LLAMADA.");
   } catch (error) {
-    console.error('Fallo de conexión de voz:', error.message);
+    console.error("❌ No se pudo conectar al VC:", error);
+
+    const conexion = client.guilds.cache
+      .find(g => g.channels.cache.has(VOICE_CHANNEL_ID));
+
+    if (conexion) {
+      getVoiceConnection(conexion.id)?.destroy();
+    }
   } finally {
-    checkingVoice = false;
+    connecting = false;
   }
 }
 
-client.once('ready', () => {
-  console.log(`¡Sargento Banano está en línea como ${client.user.tag}!`);
-  keepVoiceConnected();
-  setInterval(keepVoiceConnected, 15000);
-  setInterval(async () => {
-    const canal = client.channels.cache.find(c => c.name === 'muelle-general' && c.isTextBased());
-    if (canal) {
-      try { await canal.send(`${pick(frasesTropicales)}\n${pick(gifsMonos)}`); }
-      catch (error) { console.error('Error enviando GIF:', error.message); }
-    }
-  }, 15 * 60 * 1000);
+// REVISIÓN AUTOMÁTICA CADA 30 SEGUNDOS
+async function revisarConexion() {
+  if (!client.isReady() || connecting || shuttingDown) return;
+
+  const canal = client.channels.cache.get(VOICE_CHANNEL_ID);
+
+  if (!canal || !canal.guild) {
+    await conectarVoz();
+    return;
+  }
+
+  const conexion = getVoiceConnection(canal.guild.id);
+
+  if (
+    !conexion ||
+    conexion.state.status === VoiceConnectionStatus.Destroyed ||
+    conexion.state.status === VoiceConnectionStatus.Disconnected
+  ) {
+    console.log("🔄 El Okupa perdió su casa. Reconectando...");
+    await conectarVoz();
+  }
+}
+
+// CUANDO DISCORD ESTÉ LISTO
+client.once(Events.ClientReady, async () => {
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("🦝 EL OKUPA HA DESPERTADO");
+  console.log("🤖 Cuenta:", client.user.tag);
+  console.log("🆔 ID:", client.user.id);
+  console.log("🏠 Servidores:", client.guilds.cache.size);
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  await conectarVoz();
+
+  reconnectTimer = setInterval(revisarConexion, 30000);
 });
 
-client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-  const contenido = message.content.toLowerCase();
-  try {
-    if (contenido === '!tirar') {
-      contador += 5;
-      await message.reply(`¡BANG! ¡Le diste al mono! +5 puntos (Total: ${contador})`);
-    }
-    if (['mono', 'banano', 'explosión'].some(p => contenido.includes(p))) {
-      await message.channel.send(pick(frasesTropicales));
-    }
-    if (message.attachments.size > 0 || message.content.includes('https://tenor.com')) {
-      await message.channel.send('¡Qué sabrosura visual! Esto se va directo a los archivos del comando.');
-    }
-  } catch (error) { console.error('Error respondiendo:', error.message); }
+// ERRORES
+client.on(Events.Error, (error) => {
+  console.error("❌ Error de Discord:", error);
 });
 
-client.on('error', error => console.error('Error del cliente:', error));
-client.login(token).catch(error => { console.error('No se pudo iniciar sesión:', error.message); process.exit(1); });
+process.on("unhandledRejection", (error) => {
+  console.error("❌ Promesa rechazada:", error);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("❌ Error inesperado:", error);
+});
+
+// APAGADO ORDENADO
+function apagar() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log("🛑 El Okupa está desalojando...");
+
+  if (reconnectTimer) clearInterval(reconnectTimer);
+
+  for (const guild of client.guilds.cache.values()) {
+    getVoiceConnection(guild.id)?.destroy();
+  }
+
+  client.destroy();
+  process.exit(0);
+}
+
+process.on("SIGTERM", apagar);
+process.on("SIGINT", apagar);
+
+// INICIAR
+client.login(TOKEN).catch((error) => {
+  console.error("❌ No se pudo iniciar sesión:", error);
+  process.exit(1);
+});

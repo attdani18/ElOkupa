@@ -1,3 +1,4 @@
+
 const {
   Client,
   GatewayIntentBits,
@@ -12,24 +13,22 @@ const {
   VoiceConnectionStatus,
 } = require("@discordjs/voice");
 
-// =====================================
-// CONFIGURACIÓN
-// =====================================
+// ==========================================
+// 🦝 EL OKUPA 2.0 - VOZ PERMANENTE
+// ==========================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
 const CHECK_INTERVAL = 15000;
 const CONNECT_TIMEOUT = 30000;
+const DISCONNECT_GRACE = 10000;
+const MAX_RETRY_DELAY = 60000;
 
 if (!TOKEN || !VOICE_CHANNEL_ID) {
   console.error("❌ Faltan variables de Railway.");
   process.exit(1);
 }
-
-// =====================================
-// CLIENTE DISCORD
-// =====================================
 
 const client = new Client({
   intents: [
@@ -38,41 +37,159 @@ const client = new Client({
   ],
 });
 
+let targetGuildId = null;
 let connecting = false;
 let stopping = false;
 let checkTimer = null;
-let targetGuildId = null;
+let retryTimer = null;
+let retryCount = 0;
 let activeConnection = null;
+let recoveryPromise = null;
 
-// =====================================
-// REGISTROS DE VOZ
-// =====================================
+// ==========================================
+// UTILIDADES
+// ==========================================
 
-function registrarConexion(connection) {
+function log(message) {
+  console.log(
+    `[${new Date().toISOString()}] ${message}`
+  );
+}
+
+function retryDelay() {
+  return Math.min(
+    5000 * Math.pow(2, Math.min(retryCount, 4)),
+    MAX_RETRY_DELAY
+  );
+}
+
+function scheduleReconnect(reason) {
+  if (stopping || retryTimer || connecting) return;
+
+  const delay = retryDelay();
+  retryCount++;
+
+  log(
+    `🔄 ${reason}. Nuevo intento en ${delay / 1000}s.`
+  );
+
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    conectarVoz().catch(console.error);
+  }, delay);
+}
+
+function destroyConnection(guildId) {
+  const connection = getVoiceConnection(guildId);
+
+  if (connection) {
+    connection.destroy();
+  }
+
+  if (activeConnection === connection) {
+    activeConnection = null;
+  }
+}
+
+// ==========================================
+// EVENTOS DE CONEXIÓN
+// ==========================================
+
+function registerConnection(connection) {
   if (activeConnection === connection) return;
 
   activeConnection = connection;
 
   connection.on("stateChange", (oldState, newState) => {
-    console.log(
+    log(
       `🎙️ Voz: ${oldState.status} → ${newState.status}`
     );
 
+    if (newState.status === VoiceConnectionStatus.Ready) {
+      retryCount = 0;
+
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+
+      log("✅ Conexión de voz lista.");
+    }
+
     if (
-      newState.status === VoiceConnectionStatus.Disconnected
+      newState.status ===
+      VoiceConnectionStatus.Disconnected
     ) {
-      console.log("⚠️ El Okupa perdió la conexión.");
+      log("⚠️ Voz desconectada. Evaluando recuperación...");
+
+      if (!recoveryPromise) {
+        recoveryPromise = recoverDisconnected(connection)
+          .finally(() => {
+            recoveryPromise = null;
+          });
+      }
+    }
+
+    if (
+      newState.status ===
+      VoiceConnectionStatus.Destroyed
+    ) {
+      log("🧹 Conexión de voz destruida.");
     }
   });
 
   connection.on("error", (error) => {
-    console.error("❌ Error de voz:", error);
+    console.error(
+      "❌ Error de voz:",
+      error.message
+    );
   });
 }
 
-// =====================================
-// CONECTAR AL VC
-// =====================================
+// ==========================================
+// RECUPERAR DESCONEXIONES
+// ==========================================
+
+async function recoverDisconnected(connection) {
+  try {
+    await Promise.race([
+      entersState(
+        connection,
+        VoiceConnectionStatus.Signalling,
+        DISCONNECT_GRACE
+      ),
+      entersState(
+        connection,
+        VoiceConnectionStatus.Connecting,
+        DISCONNECT_GRACE
+      ),
+      entersState(
+        connection,
+        VoiceConnectionStatus.Ready,
+        DISCONNECT_GRACE
+      ),
+    ]);
+
+    log("🔁 Discord está recuperando la conexión.");
+  } catch {
+    if (stopping) return;
+
+    log("⚠️ La conexión no se recuperó a tiempo.");
+
+    if (
+      targetGuildId &&
+      getVoiceConnection(targetGuildId) === connection
+    ) {
+      destroyConnection(targetGuildId);
+    }
+
+    scheduleReconnect("Conexión perdida");
+  }
+}
+
+// ==========================================
+// CONECTAR AL CANAL DE VOZ
+// ==========================================
 
 async function conectarVoz() {
   if (connecting || stopping || !client.isReady()) {
@@ -95,48 +212,45 @@ async function conectarVoz() {
 
     targetGuildId = canal.guild.id;
 
-    const botMember = await canal.guild.members.fetchMe();
+    const member = await canal.guild.members.fetchMe();
 
-    const permisos = canal.permissionsFor(botMember);
+    const permissions = canal.permissionsFor(member);
 
     if (
-      !permisos?.has(PermissionFlagsBits.ViewChannel) ||
-      !permisos?.has(PermissionFlagsBits.Connect)
+      !permissions?.has(PermissionFlagsBits.ViewChannel) ||
+      !permissions?.has(PermissionFlagsBits.Connect)
     ) {
       throw new Error(
-        "El Okupa no tiene permisos para ver o conectar al VC."
+        "Faltan permisos ViewChannel o Connect."
       );
     }
 
-    console.log("━━━━━━━━━━━━━━━━━━━━");
-    console.log("🦝 Bot:", client.user.tag);
-    console.log("🏠 Servidor:", canal.guild.name);
-    console.log("🎙️ Canal:", canal.name);
-    console.log("━━━━━━━━━━━━━━━━━━━━");
-
-    let connection = getVoiceConnection(canal.guild.id);
+    const currentConnection =
+      getVoiceConnection(targetGuildId);
 
     const inCorrectChannel =
-      botMember.voice.channelId === VOICE_CHANNEL_ID;
+      member.voice.channelId === VOICE_CHANNEL_ID;
 
-    const isReady =
-      connection?.state.status ===
-      VoiceConnectionStatus.Ready;
-
-    if (isReady && inCorrectChannel) {
+    if (
+      currentConnection?.state.status ===
+        VoiceConnectionStatus.Ready &&
+      inCorrectChannel
+    ) {
+      retryCount = 0;
       return;
     }
 
-    // Eliminar conexiones anteriores o atascadas.
-    if (connection) {
-      console.log("🧹 Limpiando conexión anterior...");
-      connection.destroy();
-      activeConnection = null;
+    if (currentConnection) {
+      log("🧹 Reiniciando conexión anterior...");
+      destroyConnection(targetGuildId);
     }
 
-    console.log("🚪 Intentando ocupar el canal...");
+    log(`🦝 Bot: ${client.user.tag}`);
+    log(`🏠 Servidor: ${canal.guild.name}`);
+    log(`🎙️ Canal: ${canal.name}`);
+    log("🚪 Intentando ocupar el VC...");
 
-    connection = joinVoiceChannel({
+    const connection = joinVoiceChannel({
       channelId: canal.id,
       guildId: canal.guild.id,
       adapterCreator: canal.guild.voiceAdapterCreator,
@@ -144,7 +258,7 @@ async function conectarVoz() {
       selfMute: true,
     });
 
-    registrarConexion(connection);
+    registerConnection(connection);
 
     await entersState(
       connection,
@@ -152,36 +266,44 @@ async function conectarVoz() {
       CONNECT_TIMEOUT
     );
 
-    console.log("✅ EL OKUPA OCUPÓ EL VC.");
-    console.log("🍌 No necesita compañía para quedarse.");
+    log("🍌 EL OKUPA OCUPÓ SU CASA.");
+
+    retryCount = 0;
 
   } catch (error) {
     console.error(
-      "❌ Error al conectar:",
+      "❌ Falló conexión:",
       error.message
     );
 
     if (targetGuildId) {
-      const connection = getVoiceConnection(targetGuildId);
-
-      if (connection) {
-        connection.destroy();
-        activeConnection = null;
-      }
+      destroyConnection(targetGuildId);
     }
+
   } finally {
     connecting = false;
+
+    if (
+      !stopping &&
+      targetGuildId &&
+      !getVoiceConnection(targetGuildId)
+    ) {
+      scheduleReconnect("Reintentando ocupar el VC");
+    }
   }
 }
 
-// =====================================
-// VIGILANCIA AUTOMÁTICA
-// =====================================
+// ==========================================
+// VIGILANCIA CADA 15 SEGUNDOS
+// ==========================================
 
 async function revisarConexion() {
   if (stopping || connecting || !client.isReady()) {
     return;
   }
+
+  // Respetar el tiempo de recuperación.
+  if (recoveryPromise || retryTimer) return;
 
   try {
     const canal = await client.channels.fetch(
@@ -189,71 +311,67 @@ async function revisarConexion() {
     );
 
     if (!canal || !canal.isVoiceBased()) {
-      console.log("⚠️ Canal no disponible.");
-      return;
+      throw new Error("Canal no disponible.");
     }
 
     const member = await canal.guild.members.fetchMe();
-
-    const connection = getVoiceConnection(canal.guild.id);
-
-    const isReady =
-      connection?.state.status ===
-      VoiceConnectionStatus.Ready;
+    const connection =
+      getVoiceConnection(canal.guild.id);
 
     const inCorrectChannel =
       member.voice.channelId === VOICE_CHANNEL_ID;
 
-    if (!isReady || !inCorrectChannel) {
-      console.log(
-        "🔄 El Okupa está fuera de su casa. Recuperando VC..."
-      );
-
-      await conectarVoz();
+    if (
+      connection?.state.status ===
+        VoiceConnectionStatus.Ready &&
+      inCorrectChannel
+    ) {
+      return;
     }
+
+    log("🔎 El Okupa no está correctamente conectado.");
+
+    await conectarVoz();
 
   } catch (error) {
     console.error(
-      "⚠️ Error en vigilancia:",
+      "⚠️ Error de vigilancia:",
       error.message
     );
+
+    scheduleReconnect("Error de vigilancia");
   }
 }
 
-// =====================================
-// DETECTAR CAMBIOS EN EL VC
-// =====================================
+// ==========================================
+// DETECTAR SI MUEVEN O SACAN AL BOT
+// ==========================================
 
 client.on(
   Events.VoiceStateUpdate,
-  async (oldState, newState) => {
-
-    if (!client.user || stopping) return;
-
-    // Solo reaccionar a cambios del propio bot.
+  (oldState, newState) => {
+    if (stopping || !client.user) return;
     if (newState.id !== client.user.id) return;
 
     if (newState.channelId !== VOICE_CHANNEL_ID) {
-      console.log(
-        "🚨 ¡Sacaron al Okupa de su VC!"
-      );
+      log("🚨 El Okupa salió del canal configurado.");
 
-      await conectarVoz();
+      scheduleReconnect("Regresando al VC");
     }
   }
 );
 
-// =====================================
-// INICIO DEL BOT
-// =====================================
+// ==========================================
+// INICIO
+// ==========================================
 
 client.once(Events.ClientReady, async () => {
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("🦝 EL OKUPA HA DESPERTADO");
-  console.log("🤖 Cuenta:", client.user.tag);
-  console.log("🆔 ID:", client.user.id);
-  console.log("🏠 Servidores:", client.guilds.cache.size);
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━");
+  log("━━━━━━━━━━━━━━━━━━━━━━━━");
+  log("🦝 EL OKUPA 2.0 HA DESPERTADO");
+  log(`🤖 Cuenta: ${client.user.tag}`);
+  log(`🆔 ID: ${client.user.id}`);
+  log(`🏠 Servidores: ${client.guilds.cache.size}`);
+  log("━━━━━━━━━━━━━━━━━━━━━━━━");
 
   await conectarVoz();
 
@@ -263,12 +381,23 @@ client.once(Events.ClientReady, async () => {
   );
 });
 
-// =====================================
+// ==========================================
 // ERRORES
-// =====================================
+// ==========================================
 
 client.on(Events.Error, (error) => {
   console.error("❌ Discord:", error);
+});
+
+client.on(Events.ShardDisconnect, (event, shardId) => {
+  log(
+    `⚠️ Gateway desconectado. Shard ${shardId}, código ${event.code}`
+  );
+});
+
+client.on(Events.ShardResume, (shardId) => {
+  log(`✅ Gateway recuperado. Shard ${shardId}`);
+  revisarConexion().catch(console.error);
 });
 
 process.on("unhandledRejection", (error) => {
@@ -279,41 +408,35 @@ process.on("uncaughtException", (error) => {
   console.error("❌ Error inesperado:", error);
 });
 
-// =====================================
-// APAGADO ORDENADO
-// =====================================
+// ==========================================
+// APAGADO
+// ==========================================
 
-function apagar() {
+function shutdown() {
   if (stopping) return;
 
   stopping = true;
+  log("🛑 El Okupa se está apagando.");
 
-  console.log("🛑 El Okupa está cerrando...");
-
-  if (checkTimer) {
-    clearInterval(checkTimer);
-  }
+  if (checkTimer) clearInterval(checkTimer);
+  if (retryTimer) clearTimeout(retryTimer);
 
   if (targetGuildId) {
-    getVoiceConnection(targetGuildId)?.destroy();
+    destroyConnection(targetGuildId);
   }
 
   client.destroy();
   process.exit(0);
 }
 
-process.on("SIGTERM", apagar);
-process.on("SIGINT", apagar);
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
-// =====================================
+// ==========================================
 // LOGIN
-// =====================================
+// ==========================================
 
 client.login(TOKEN).catch((error) => {
-  console.error(
-    "❌ No se pudo iniciar sesión:",
-    error
-  );
-
+  console.error("❌ Error iniciando sesión:", error);
   process.exit(1);
 });

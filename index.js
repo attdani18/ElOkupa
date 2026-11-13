@@ -4,6 +4,11 @@ const {
   GatewayIntentBits,
   Events,
   PermissionFlagsBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  MessageFlags,
 } = require("discord.js");
 
 const {
@@ -14,11 +19,13 @@ const {
 } = require("@discordjs/voice");
 
 // ==========================================
-// 🦝 EL OKUPA 2.0 - VOZ PERMANENTE
+// EL OKUPA 3.0 - RADIO OKUPA 506
 // ==========================================
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
+const DASHBOARD_CHANNEL_ID =
+  process.env.DASHBOARD_CHANNEL_ID;
 
 const CHECK_INTERVAL = 15000;
 const CONNECT_TIMEOUT = 30000;
@@ -26,7 +33,7 @@ const DISCONNECT_GRACE = 10000;
 const MAX_RETRY_DELAY = 60000;
 
 if (!TOKEN || !VOICE_CHANNEL_ID) {
-  console.error("❌ Faltan variables de Railway.");
+  console.error("Faltan variables de Railway.");
   process.exit(1);
 }
 
@@ -37,6 +44,15 @@ const client = new Client({
   ],
 });
 
+const settings = {
+  mode: "lofi",
+  audio8d: true,
+  volume: 35,
+  news: true,
+  memes: true,
+  voiceAI: false,
+};
+
 let targetGuildId = null;
 let connecting = false;
 let stopping = false;
@@ -45,6 +61,8 @@ let retryTimer = null;
 let retryCount = 0;
 let activeConnection = null;
 let recoveryPromise = null;
+let nightTimer = null;
+let dashboardMessage = null;
 
 // ==========================================
 // UTILIDADES
@@ -70,7 +88,7 @@ function scheduleReconnect(reason) {
   retryCount++;
 
   log(
-    `🔄 ${reason}. Nuevo intento en ${delay / 1000}s.`
+    `Reconexión: ${reason}. Intento en ${delay / 1000}s.`
   );
 
   retryTimer = setTimeout(() => {
@@ -92,6 +110,63 @@ function destroyConnection(guildId) {
 }
 
 // ==========================================
+// MODO MADRUGADA - COSTA RICA
+// ==========================================
+
+function isNightMode() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "America/Costa_Rica",
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date());
+
+  const hour = Number(
+    parts.find(p => p.type === "hour").value
+  );
+
+  return hour >= 23 || hour < 7;
+}
+
+function getEffectiveSettings() {
+  const night = isNightMode();
+
+  return {
+    ...settings,
+    nightMode: night,
+    volume: night ? 15 : settings.volume,
+    allowSpokenNews: night ? false : settings.news,
+    allowSpokenMemes: night ? false : settings.memes,
+    voiceAI: false,
+  };
+}
+
+let previousNightState = null;
+
+function checkNightMode() {
+  const effective = getEffectiveSettings();
+
+  if (effective.nightMode !== previousNightState) {
+    previousNightState = effective.nightMode;
+
+    log(
+      effective.nightMode
+        ? "Modo madrugada activado."
+        : "Modo diurno activado."
+    );
+
+    log(`Volumen configurado: ${effective.volume}%`);
+    log(
+      `Noticias habladas: ${effective.allowSpokenNews}`
+    );
+    log(
+      `Memes hablados: ${effective.allowSpokenMemes}`
+    );
+
+    updateDashboard().catch(console.error);
+  }
+}
+
+// ==========================================
 // EVENTOS DE CONEXIÓN
 // ==========================================
 
@@ -102,7 +177,7 @@ function registerConnection(connection) {
 
   connection.on("stateChange", (oldState, newState) => {
     log(
-      `🎙️ Voz: ${oldState.status} → ${newState.status}`
+      `Voz: ${oldState.status} -> ${newState.status}`
     );
 
     if (newState.status === VoiceConnectionStatus.Ready) {
@@ -113,14 +188,14 @@ function registerConnection(connection) {
         retryTimer = null;
       }
 
-      log("✅ Conexión de voz lista.");
+      log("Conexión de voz lista.");
     }
 
     if (
       newState.status ===
       VoiceConnectionStatus.Disconnected
     ) {
-      log("⚠️ Voz desconectada. Evaluando recuperación...");
+      log("Voz desconectada. Evaluando recuperación...");
 
       if (!recoveryPromise) {
         recoveryPromise = recoverDisconnected(connection)
@@ -129,20 +204,10 @@ function registerConnection(connection) {
           });
       }
     }
-
-    if (
-      newState.status ===
-      VoiceConnectionStatus.Destroyed
-    ) {
-      log("🧹 Conexión de voz destruida.");
-    }
   });
 
-  connection.on("error", (error) => {
-    console.error(
-      "❌ Error de voz:",
-      error.message
-    );
+  connection.on("error", error => {
+    console.error("Error de voz:", error);
   });
 }
 
@@ -170,11 +235,11 @@ async function recoverDisconnected(connection) {
       ),
     ]);
 
-    log("🔁 Discord está recuperando la conexión.");
+    log("Discord está recuperando la conexión.");
   } catch {
     if (stopping) return;
 
-    log("⚠️ La conexión no se recuperó a tiempo.");
+    log("La conexión no se recuperó a tiempo.");
 
     if (
       targetGuildId &&
@@ -188,7 +253,7 @@ async function recoverDisconnected(connection) {
 }
 
 // ==========================================
-// CONECTAR AL CANAL DE VOZ
+// CONECTAR AL VC
 // ==========================================
 
 async function conectarVoz() {
@@ -205,15 +270,12 @@ async function conectarVoz() {
     );
 
     if (!canal || !canal.isVoiceBased()) {
-      throw new Error(
-        "No se encontró un canal de voz válido."
-      );
+      throw new Error("Canal de voz no encontrado.");
     }
 
     targetGuildId = canal.guild.id;
 
     const member = await canal.guild.members.fetchMe();
-
     const permissions = canal.permissionsFor(member);
 
     if (
@@ -241,14 +303,14 @@ async function conectarVoz() {
     }
 
     if (currentConnection) {
-      log("🧹 Reiniciando conexión anterior...");
+      log("Limpiando conexión anterior...");
       destroyConnection(targetGuildId);
     }
 
-    log(`🦝 Bot: ${client.user.tag}`);
-    log(`🏠 Servidor: ${canal.guild.name}`);
-    log(`🎙️ Canal: ${canal.name}`);
-    log("🚪 Intentando ocupar el VC...");
+    log(`Bot: ${client.user.tag}`);
+    log(`Servidor: ${canal.guild.name}`);
+    log(`Canal: ${canal.name}`);
+    log("Intentando ocupar el VC...");
 
     const connection = joinVoiceChannel({
       channelId: canal.id,
@@ -266,15 +328,11 @@ async function conectarVoz() {
       CONNECT_TIMEOUT
     );
 
-    log("🍌 EL OKUPA OCUPÓ SU CASA.");
-
+    log("EL OKUPA OCUPÓ SU CASA.");
     retryCount = 0;
 
   } catch (error) {
-    console.error(
-      "❌ Falló conexión:",
-      error.message
-    );
+    console.error("Falló conexión:", error.message);
 
     if (targetGuildId) {
       destroyConnection(targetGuildId);
@@ -294,7 +352,7 @@ async function conectarVoz() {
 }
 
 // ==========================================
-// VIGILANCIA CADA 15 SEGUNDOS
+// VIGILANCIA
 // ==========================================
 
 async function revisarConexion() {
@@ -302,7 +360,6 @@ async function revisarConexion() {
     return;
   }
 
-  // Respetar el tiempo de recuperación.
   if (recoveryPromise || retryTimer) return;
 
   try {
@@ -315,8 +372,7 @@ async function revisarConexion() {
     }
 
     const member = await canal.guild.members.fetchMe();
-    const connection =
-      getVoiceConnection(canal.guild.id);
+    const connection = getVoiceConnection(canal.guild.id);
 
     const inCorrectChannel =
       member.voice.channelId === VOICE_CHANNEL_ID;
@@ -329,23 +385,14 @@ async function revisarConexion() {
       return;
     }
 
-    log("🔎 El Okupa no está correctamente conectado.");
-
+    log("El Okupa está fuera de su casa.");
     await conectarVoz();
 
   } catch (error) {
-    console.error(
-      "⚠️ Error de vigilancia:",
-      error.message
-    );
-
+    console.error("Error de vigilancia:", error.message);
     scheduleReconnect("Error de vigilancia");
   }
 }
-
-// ==========================================
-// DETECTAR SI MUEVEN O SACAN AL BOT
-// ==========================================
 
 client.on(
   Events.VoiceStateUpdate,
@@ -354,58 +401,293 @@ client.on(
     if (newState.id !== client.user.id) return;
 
     if (newState.channelId !== VOICE_CHANNEL_ID) {
-      log("🚨 El Okupa salió del canal configurado.");
-
+      log("El Okupa salió del canal configurado.");
       scheduleReconnect("Regresando al VC");
     }
   }
 );
 
 // ==========================================
-// INICIO
+// DASHBOARD DE RADIO OKUPA 506
+// ==========================================
+
+function buildDashboard() {
+  const s = getEffectiveSettings();
+
+  const embed = new EmbedBuilder()
+    .setColor(s.nightMode ? 0x483d8b : 0xff8c00)
+    .setTitle("🦝 RADIO OKUPA 506")
+    .setDescription(
+      "La frecuencia que nadie autorizó.\n" +
+      "Centro de control de Puerto Banano 506."
+    )
+    .addFields(
+      {
+        name: "Estación",
+        value: s.mode.toUpperCase(),
+        inline: true,
+      },
+      {
+        name: "Volumen",
+        value: `${s.volume}%`,
+        inline: true,
+      },
+      {
+        name: "Audio 8D",
+        value: s.audio8d ? "Activado" : "Desactivado",
+        inline: true,
+      },
+      {
+        name: "Modo madrugada",
+        value: s.nightMode ? "Activo" : "Inactivo",
+        inline: true,
+      },
+      {
+        name: "Noticias habladas",
+        value: s.allowSpokenNews ? "Sí" : "No",
+        inline: true,
+      },
+      {
+        name: "Memes hablados",
+        value: s.allowSpokenMemes ? "Sí" : "No",
+        inline: true,
+      },
+      {
+        name: "Interacción por voz",
+        value: "Desactivada",
+        inline: true,
+      }
+    )
+    .setFooter({
+      text: "El Okupa 3.0 | Hora de Costa Rica"
+    });
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("okupa_lofi")
+      .setLabel("Lo-fi")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("okupa_sleep")
+      .setLabel("Dormir")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("okupa_silence")
+      .setLabel("Silencio")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("okupa_8d")
+      .setLabel("Audio 8D")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("okupa_vol_down")
+      .setLabel("Vol -")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("okupa_vol_up")
+      .setLabel("Vol +")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("okupa_news")
+      .setLabel("Noticias")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("okupa_memes")
+      .setLabel("Memes")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("okupa_status")
+      .setLabel("Estado")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return {
+    embeds: [embed],
+    components: [row1, row2, row3],
+  };
+}
+
+async function updateDashboard() {
+  if (!dashboardMessage) return;
+
+  try {
+    await dashboardMessage.edit(buildDashboard());
+  } catch (error) {
+    console.error(
+      "Error actualizando dashboard:",
+      error.message
+    );
+  }
+}
+
+async function publishDashboard() {
+  if (!DASHBOARD_CHANNEL_ID) {
+    log("Dashboard desactivado: falta DASHBOARD_CHANNEL_ID.");
+    return;
+  }
+
+  const channel = await client.channels.fetch(
+    DASHBOARD_CHANNEL_ID
+  );
+
+  if (!channel || !channel.isTextBased()) {
+    throw new Error(
+      "El canal del dashboard no admite mensajes."
+    );
+  }
+
+  dashboardMessage = await channel.send(
+    buildDashboard()
+  );
+
+  log("Dashboard publicado correctamente.");
+}
+
+// ==========================================
+// BOTONES
+// ==========================================
+
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isButton()) return;
+  if (!interaction.customId.startsWith("okupa_")) return;
+
+  if (interaction.customId === "okupa_status") {
+    const connection = targetGuildId
+      ? getVoiceConnection(targetGuildId)
+      : null;
+
+    return interaction.reply({
+      content:
+        `🦝 Estado: ${connection?.state.status || "Sin conexión"}\n` +
+        `🌙 Madrugada: ${isNightMode() ? "Sí" : "No"}\n` +
+        `🔊 Volumen: ${getEffectiveSettings().volume}%`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const authorized =
+    interaction.memberPermissions?.has(
+      PermissionFlagsBits.ManageGuild
+    ) ||
+    interaction.memberPermissions?.has(
+      PermissionFlagsBits.Administrator
+    );
+
+  if (!authorized) {
+    return interaction.reply({
+      content: "Solo los moderadores pueden cambiar la radio.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const id = interaction.customId;
+
+  if (id === "okupa_lofi") settings.mode = "lofi";
+  if (id === "okupa_sleep") settings.mode = "sleep";
+  if (id === "okupa_silence") settings.mode = "silence";
+
+  if (id === "okupa_8d") {
+    settings.audio8d = !settings.audio8d;
+  }
+
+  if (id === "okupa_vol_down") {
+    settings.volume = Math.max(0, settings.volume - 5);
+  }
+
+  if (id === "okupa_vol_up") {
+    settings.volume = Math.min(100, settings.volume + 5);
+  }
+
+  if (id === "okupa_news") {
+    settings.news = !settings.news;
+  }
+
+  if (id === "okupa_memes") {
+    settings.memes = !settings.memes;
+  }
+
+  await interaction.update(buildDashboard());
+
+  log(`Dashboard actualizado por ${interaction.user.tag}`);
+});
+
+// ==========================================
+// INICIO DEL BOT
 // ==========================================
 
 client.once(Events.ClientReady, async () => {
   log("━━━━━━━━━━━━━━━━━━━━━━━━");
-  log("🦝 EL OKUPA 2.0 HA DESPERTADO");
-  log(`🤖 Cuenta: ${client.user.tag}`);
-  log(`🆔 ID: ${client.user.id}`);
-  log(`🏠 Servidores: ${client.guilds.cache.size}`);
+  log("🦝 EL OKUPA 3.0 HA DESPERTADO");
+  log(`Cuenta: ${client.user.tag}`);
+  log(`ID: ${client.user.id}`);
+  log(`Servidores: ${client.guilds.cache.size}`);
   log("━━━━━━━━━━━━━━━━━━━━━━━━");
 
+  // Conexión permanente al VC
   await conectarVoz();
 
+  // Vigilar la conexión cada 15 segundos
   checkTimer = setInterval(
     revisarConexion,
     CHECK_INTERVAL
   );
+
+  // Activar modo madrugada
+  checkNightMode();
+
+  nightTimer = setInterval(
+    checkNightMode,
+    30000
+  );
+
+  // Publicar dashboard
+  try {
+    await publishDashboard();
+  } catch (error) {
+    console.error(
+      "Error publicando dashboard:",
+      error.message
+    );
+  }
 });
 
 // ==========================================
-// ERRORES
+// EVENTOS Y ERRORES
 // ==========================================
 
-client.on(Events.Error, (error) => {
-  console.error("❌ Discord:", error);
+client.on(Events.Error, error => {
+  console.error("Error de Discord:", error);
 });
 
 client.on(Events.ShardDisconnect, (event, shardId) => {
   log(
-    `⚠️ Gateway desconectado. Shard ${shardId}, código ${event.code}`
+    `Gateway desconectado. Shard ${shardId}, código ${event.code}`
   );
 });
 
-client.on(Events.ShardResume, (shardId) => {
-  log(`✅ Gateway recuperado. Shard ${shardId}`);
+client.on(Events.ShardResume, shardId => {
+  log(`Gateway recuperado. Shard ${shardId}`);
   revisarConexion().catch(console.error);
 });
 
-process.on("unhandledRejection", (error) => {
-  console.error("❌ Promesa rechazada:", error);
+process.on("unhandledRejection", error => {
+  console.error("Promesa rechazada:", error);
 });
 
-process.on("uncaughtException", (error) => {
-  console.error("❌ Error inesperado:", error);
+process.on("uncaughtException", error => {
+  console.error("Error inesperado:", error);
 });
 
 // ==========================================
@@ -416,10 +698,12 @@ function shutdown() {
   if (stopping) return;
 
   stopping = true;
-  log("🛑 El Okupa se está apagando.");
+
+  log("El Okupa está cerrando.");
 
   if (checkTimer) clearInterval(checkTimer);
   if (retryTimer) clearTimeout(retryTimer);
+  if (nightTimer) clearInterval(nightTimer);
 
   if (targetGuildId) {
     destroyConnection(targetGuildId);
@@ -436,7 +720,7 @@ process.on("SIGINT", shutdown);
 // LOGIN
 // ==========================================
 
-client.login(TOKEN).catch((error) => {
-  console.error("❌ Error iniciando sesión:", error);
+client.login(TOKEN).catch(error => {
+  console.error("Error iniciando sesión:", error);
   process.exit(1);
 });
